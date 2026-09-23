@@ -1961,3 +1961,123 @@ forward_phsmm <- function(dm, omega, allprobs, tod,
   
   as.numeric(l)
 }
+
+
+# CTHSMMs -------------------------------------------------------------------
+
+
+#' Calculates the (approximate) log-likelihood of a sequence of observations under a homogeneous continuous-time hidden semi-Markov model using a modified \strong{forward algorithm}.
+#'
+#' @family forward algorithms
+#'
+#' @details
+#' Continuous-time hidden semi-Markov models (CTHSMMs) are the counterparts to discrete-time hidden semi-Markov models, where the state duration distribution is explicitly modelled by a distribution on the positive real line instead of being restricted to an exponential distribution.
+#' For direct numerical maximum likelihood estimation, CTHSMMs can be approximated by CTHMMs on an enlarged state space (of size \eqn{M}) with a structured generator matrix.
+#' Each state is represented by a state aggregate of sub-states that together form a phase-type approximation of the state's dwell-time distribution.
+#' When a state is left, the next state is selected according to the embedded transition probabilities.
+#'
+#' Two constructions of the state aggregates are available, both of which are computed directly from the dwell-time distribution, such that no additional parameters need to be estimated:
+#' \itemize{
+#'   \item \strong{Bernstein phase-type} (Horváth et al., 2025): The state is entered in one of the sub-states with probabilities obtained from the dwell-time CDF evaluated at a fixed set of points, and is left only from the last sub-state. The sub-states are traversed at fixed, increasing rates, which can be adjusted by a scaling parameter \eqn{\kappa_i}.
+#'   \item \strong{Modified Coxian}: The state is always entered in its first sub-state. For state \eqn{i} with grid width \eqn{\Delta_i}, the sub-states are traversed at the fixed rate \eqn{1 / \Delta_i}, and the state is left from sub-state \eqn{k} according to the discrete hazard
+#'   \deqn{c_k = 1 - S_i(k \Delta_i) / S_i((k-1) \Delta_i),}
+#'   where \eqn{S_i} denotes the survival function of the dwell-time distribution in state \eqn{i}. The last sub-state only allows for leaving the state and thus induces an exponential tail.
+#' }
+#' For both constructions, the approximation converges to the target dwell-time distribution as the number of sub-states increases.
+#'
+#' This function is designed to be used with automatic differentiation based on the \code{R} package \code{RTMB}. It will be very slow without it!
+#'
+#'
+#' @param dm list of length \code{nStates} containing one vector per state, whose length determines the size \eqn{m_i} of the state's aggregate. Its content depends on \code{type}:
+#' \itemize{
+#'   \item \code{type = "coxian"}: the probabilities of the dwell time falling into the grid intervals \eqn{((k-1)\Delta_i, k\Delta_i]}, \eqn{k = 1, \dots, m_i}, from which the discrete hazards are computed.
+#'   \item \code{type = "bernstein"}: the entry probabilities of the sub-states, obtained from the dwell-time CDF at the Bernstein sampling points.
+#' }
+#' @param omega matrix of dimension \code{c(nStates, nStates)} of conditional transition probabilities, also called embedded transition probability matrix.
+#'
+#' Contains the transition probabilities given that the current state is left. Hence, the diagonal elements need to be zero and the rows need to sum to one. Can be constructed using \code{\link{tpm_emb}}.
+#' @param allprobs matrix of state-dependent probabilities/ density values of dimension \code{c(nObs, nStates)} which will automatically be converted to the appropriate dimension.
+#' @param timediff vector of length \code{nObs - 1} containing the time differences between consecutive observations.
+#' @param tmax upper end of the time grid for each state, only needed for \code{type = "coxian"}. Together with the state aggregate sizes, it determines the grid widths \eqn{\Delta_i = t_{\max,i} / m_i}.
+#' @param type character string specifying the construction of the state aggregates, either \code{"coxian"} (default) for the modified Coxian or \code{"bernstein"} for the Bernstein phase-type approximation.
+#' @param kappa scaling parameter for the Bernstein phase-type approximation, only needed for \code{type = "bernstein"}. It scales the rates at which the sub-states are traversed and thereby the time range covered by the approximation.
+#' @param delta optional vector of initial state probabilities of length \code{nStates}.
+#'
+#' Each state's probability is assigned to its entry sub-states, i.e. to the first sub-state for \code{type = "coxian"} and according to the entry probabilities for \code{type = "bernstein"}.
+#' By default, the stationary distribution of the approximating continuous-time Markov chain is computed (which is typically recommended).
+#' @param eps small value to avoid numerical issues in the approximating generator matrix construction. Usually, this should not be changed.
+#' @param tol tolerance for the computation of the matrix exponential's action on the forward variable. Usually, this should not be changed.
+#' @param report logical, indicating whether the initial distribution, the approximating generator matrix and the \code{allprobs} matrix should be reported from the fitted model. Defaults to \code{TRUE}.
+#'
+#' @return CTHSMM log-likelihood for given data and parameters
+#' @export
+#' @import RTMB
+#'
+#' @examples
+#' # currently no examples
+
+forward_cthsmm <- function(dm, omega, allprobs, timediff, tmax = NULL,
+                           type = c("coxian", "bernstein"), kappa = NULL,
+                           delta = NULL, eps = 1e-10, tol = 1e-10, report = TRUE) {
+  # overloading assignment operators, currently necessary
+  "[<-" <- ADoverload("[<-")
+  "c" <- ADoverload("c")
+  "diag<-" <- ADoverload("diag<-")
+
+  type = match.arg(type)
+
+  agsizes = vapply(dm, length, 1L)
+
+  N = ncol(allprobs) # number of HSMM states
+  M = sum(agsizes)   # total number of states of the approximating CTMC
+
+  stateInds <- rep(1:N, times = agsizes)
+
+  stationary = is.null(delta) # if delta is not provided, stationary distribution needs to be computed
+
+  if (length(dm) != N) stop("dm needs to be a list of length ncol(allprobs).")
+  if (length(timediff) != nrow(allprobs) - 1) stop("timediff needs to have length nrow(allprobs) - 1.")
+
+  ## compute approximating generator (like tpm_hsmm in forward_hsmm)
+  ## (checks tmax for coxian and kappa for bernstein)
+  Q = generator_cthsmm(omega, dm, tmax = tmax, type = type, kappa = kappa, eps = eps)
+
+  ## if stationary, compute initial stationary distribution
+  if (stationary) {
+    delta_star = stationary_ct(as.matrix(Q))
+  } else { # if delta is provided, spread each state's mass over its entry phases (alpha)
+    alpha = lapply(1:N, function(j) {
+      if (type == "coxian") c(1, rep(0, agsizes[j] - 1)) else dm[[j]] # "stuff out" with zeros as in the hsmm case
+    })
+    delta_star = do.call(c, lapply(1:N, function(j) delta[j] * alpha[[j]]))
+  }
+  delta_star = matrix(delta_star, nrow = 1)
+
+  ## report quantities for state decoding
+  if (report) {
+    RTMB::REPORT(delta_star)
+    RTMB::REPORT(Q)
+    RTMB::REPORT(allprobs)
+  }
+
+  ## making AD work fine
+  Q = AD(Q)
+  allprobs = AD(allprobs)
+
+  # forward algorithm
+  foo = delta_star * allprobs[1, stateInds, drop = FALSE]
+  sumfoo = sum(foo)
+  phi = foo / sumfoo
+  l = log(sumfoo)
+
+  for (t in 2:nrow(allprobs)) {
+    foo = t(RTMB::expAv(Q * timediff[t - 1], t(phi),
+                        transpose = TRUE, tol = tol, trace = FALSE))
+    foo = foo * allprobs[t, stateInds, drop = FALSE]
+    sumfoo = sum(foo)
+    phi = foo / sumfoo
+    l = l + log(sumfoo)
+  }
+
+  as.numeric(l)
+}
