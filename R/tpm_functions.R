@@ -1386,96 +1386,98 @@ tpm_phsmm = function(omega, dm,
 
 
 
-#' Builds the phase-type block of a state aggregate using a modified Coxian phase-type construction
+#' Builds the state aggregate of a CTHSMM-approximating CTHMM using a modified Coxian phase-type construction
 #'
 #' @description
-#' Computes the sub-generator, entry distribution and exit rates of the modified Coxian phase-type distribution that approximates the dwell-time distribution of one state.
-#' The interval \eqn{[0, t_{\max}]} is split into \eqn{m} equal parts of width \eqn{\Delta = t_{\max} / m}, and each sub-state represents one of them. The state is always entered in the first sub-state, sub-states are traversed at rate \eqn{1 / \Delta}.
-#' The probability of leaving from sub-state \eqn{k} equals the dwell-time distribution's discrete hazard on the \eqn{k}-th interval.
+#' Computes the sub-generator, entry distribution and exit rates of the state aggregate that approximates the dwell-time distribution of one state by a modified Coxian phase-type distribution.
+#' The time axis is divided into intervals of equal width \eqn{\Delta = t_{\max} / (m - 1)}, each represented by one state of the aggregate, with the last one forming an exponential tail beyond \eqn{t_{\max}}.
+#' Each of these states is left towards absorption at the average hazard of its interval.
 #'
-#' Note that the last sub-state induces an exponential tail that already starts at \eqn{t_{\max} - \Delta}, not at \eqn{t_{\max}}. Its rate is based on the hazard of the last interval, so \eqn{t_{\max}} should be chosen such that little probability mass lies beyond it.
+#' @param dm_i vector of length \eqn{m} containing the probabilities of the dwell time falling into each interval. Its length determines the state aggregate size.
+#' @param tmax_i start of the exponential tail, determining the interval width \eqn{\Delta = t_{\max} / (m - 1)}.
+#' @param Fm_i optional vector containing the cumulative distribution function of the dwell-time distribution at the interval starts.
+#' @param eps small value to avoid numerical issues. Usually, this should not be changed.
 #'
-#' @param dm_i vector of length \eqn{m} containing the probabilities of the dwell time falling into the grid intervals \eqn{((k-1)\Delta, k\Delta]}, \eqn{k = 1, \dots, m}. Its length determines the size of the state aggregate.
-#' @param tmax_i upper end of the time grid, which together with \eqn{m} determines the grid width \eqn{\Delta = t_{\max} / m}.
-#' @param eps small value to avoid numerical issues when computing the discrete hazards. Usually, this should not be changed.
-#'
-#' @return list containing the sub-generator \code{B} of dimension \code{c(m, m)}, the entry distribution \code{alpha}, the exit rate vector \code{b}, and the indices of the sub-states from which the state can be left (\code{exit_rows}) and entered (\code{entry_cols}).
+#' @return list containing the sub-generator \code{B}, the entry distribution \code{alpha}, the exit rates \code{b}, and the indices of the states of the aggregate from which it can be left and entered.
 #' @keywords internal
-ph_coxian <- function(dm_i, tmax_i, eps = 1e-10) {
+ph_coxian <- function(dm_i, tmax_i, Fm_i = NULL, eps = 1e-10) {
   "[<-" <- ADoverload("[<-")
   "c" <- ADoverload("c")
-  m  = length(dm_i)
-  mu = m / tmax_i                                   
-  Fm = cumsum(c(0, dm_i[-m]))                        
-  ci = max2(dm_i, eps) / (1 - Fm + eps/2)
-  ci = min2(ci, 1 - eps)                            
-  h  = mu * ci / (1 - ci)                           
+  m = length(dm_i)
+  Delta = tmax_i / (m - 1)
 
-  B = diag(-(mu + h), m, m)
-  B[m, m] = -h[m]                                   
-  if (m > 1) B[cbind(1:(m - 1), 2:m)] = mu
+  if (is.null(Fm_i)) Fm_i = cumsum(c(0, dm_i[-m])) 
+  ci = max2(dm_i, eps) / (1 - Fm_i + eps/2)
+  cim = max2(1 - ci, eps)
 
-  list(B = B, alpha = c(1, rep(0, m - 1)), b = h,
-       exit_rows = 1:m, entry_cols = 1)             
+  H = -log(cim) # increments of cumulative hazard
+  lambda = H / Delta # rate of absorption
+  mu = lambda / expm1(H) # rate of progression
+
+  B = diag(-(mu + lambda), m, m)
+  B[m, m] = -lambda[m] # last sub-state: exponential tail
+  if (m > 1) B[cbind(1:(m - 1), 2:m)] = mu[1:(m - 1)]
+
+  list(B = B, alpha = c(1, rep(0, m - 1)), b = lambda,
+       exit_rows = 1:m, entry_cols = 1)
 }
 
-
-#' Builds the phase-type block of a state aggregate using the Bernstein phase-type construction
+#' Builds the state aggregate of a CTHSMM-approximating CTHMM using the Bernstein phase-type construction
 #'
 #' @description
-#' Computes the sub-generator, entry distribution and exit rates of the Bernstein phase-type distribution (Horváth et al., 2025) that approximates the dwell-time distribution of one state.
-#' The state is entered in sub-state \eqn{k} with probability \eqn{\alpha_k}, obtained from the dwell-time CDF evaluated at the Bernstein sampling points. Sub-state \eqn{k} is left at rate \eqn{k \kappa}, either to the next sub-state or, for the last sub-state, out of the state. 
-#' Hence, the state can only be left from its last sub-state.
+#' Computes the sub-generator, entry distribution and exit rates of the state aggregate approximating the dwell-time distribution of one state by a Bernstein phase-type distribution (Horváth et al., 2025).
+#' The aggregate is entered in its \eqn{k}-th state with probability \eqn{\alpha_k} and can only be left from its last state.
+#' 
+#' @references
+#' Horváth, A., Horváth, I., Paolieri, M., Telek, M., & Vicario, E. (2025).
+#' Approximation of cumulative distribution functions by Bernstein phase-type distributions.
+#' \emph{Performance Evaluation}, 168, 102480.
 #'
-#' @param dm_i vector of length \eqn{m} containing the entry probabilities \eqn{\alpha_k} of the sub-states, which are given by
-#' \deqn{\alpha_k = F\left(\frac{1}{\kappa}\log\frac{m}{k-1}\right) - F\left(\frac{1}{\kappa}\log\frac{m}{k}\right), \quad k = 1, \dots, m,}
-#' where \eqn{F} denotes the dwell-time CDF and \eqn{F(\infty) = 1}. Its length determines the size of the state aggregate.
-#' @param kappa scaling parameter for the rates at which the sub-states are traversed. Defaults to \code{1}, which corresponds to the unscaled Bernstein phase-type distribution.
+#' @param dm_i vector of length \eqn{m} containing the entry probabilities \eqn{\alpha_k}, obtained from the dwell-time CDF at the Bernstein sampling points. Its length determines the state aggregate size.
+#' @param tmax_i scaling parameter determining where the dwell-time CDF is evaluated. The sampling points are \eqn{\log(m/k) / t_{\max}}, \eqn{k = 0, \dots, m}. Use the same value when computing \code{dm_i}. Defaults to \code{1}.
 #'
-#' @return list containing the sub-generator \code{B} of dimension \code{c(m, m)}, the entry distribution \code{alpha}, the exit rate vector \code{b}, and the indices of the sub-states from which the state can be left (\code{exit_rows}) and entered (\code{entry_cols}).
+#' @return list containing the sub-generator \code{B}, the entry distribution \code{alpha}, the exit rates \code{b}, and the indices of the states of the aggregate from which it can be left and entered.
 #' @keywords internal
-ph_bernstein <- function(dm_i, tmax_i, kappa = 1) {
+ph_bernstein <- function(dm_i, tmax_i = 1) {
   "[<-" <- ADoverload("[<-")
   "c" <- ADoverload("c")
   m      = length(dm_i)
-  rates  = (1:m) * kappa
+  rates  = (1:m) * tmax_i
 
   B = diag(-rates, m, m)
   if (m > 1) B[cbind(1:(m - 1), 2:m)] = rates[1:(m - 1)]
 
-  list(B = B, alpha = dm_i, b = c(rep(0, m - 1), m * kappa),
+  list(B = B, alpha = dm_i, b = c(rep(0, m - 1), m * tmax_i),
        exit_rows = m, entry_cols = 1:m)            
 }
 
 #' Builds the generator matrix of a CTHSMM-approximating CTHMM
 #'
 #' @description
-#' Continuous-time hidden semi-Markov models (CTHSMMs) are the counterparts to discrete-time hidden semi-Markov models, where the state duration distribution is explicitly modelled by a distribution on the positive real line.
-#' For direct numerical maximum likelihood estimation, CTHSMMs can be approximated by CTHMMs on an enlarged state space (of size \eqn{M}) with a structured generator matrix.
+#' Continuous-time hidden semi-Markov models (CTHSMMs) are a flexible extension of CTHMMs, where the state duration distribution is explicitly modelled by a distribution on the positive real line.
+#' For direct numerical maximum likelihood estimation, CTHSMMs can be approximated by CTHMMs on an enlarged state space (of size \eqn{M}) and with a structured generator matrix.
 #'
 #' This function computes the generator matrix to approximate a given CTHSMM by a CTHMM with a larger state space.
-#' Each state \eqn{i} is represented by a state aggregate whose sub-generator \eqn{B_i} forms the \eqn{i}-th diagonal block. The off-diagonal blocks are given by
-#' \deqn{C_{ij} = \omega_{ij} \, b_i \alpha_j^\top,}
-#' where \eqn{b_i} denotes the exit rate vector of state \eqn{i} and \eqn{\alpha_j} the entry distribution of state \eqn{j}.
-#' Two constructions of the state aggregates are available via \code{type}: the modified Coxian (see \code{\link{ph_coxian}}) and the Bernstein phase-type approximation (see \code{\link{ph_bernstein}}).
+#' Two constructions of the state aggregates are available via \code{type}: a modified Coxian and the Bernstein phase-type distribution (Horváth et al., 2025).
 #'
 #' @references
-#' Horváth, G., et al. (2025). 
-#'
+#' Horváth, A., Horváth, I., Paolieri, M., Telek, M., & Vicario, E. (2025).
+#' Approximation of cumulative distribution functions by Bernstein phase-type distributions.
+#' \emph{Performance Evaluation}, 168, 102480.
 #'
 #' @param omega embedded transition probability matrix of dimension \code{c(nStates, nStates)} as computed by \code{\link{tpm_emb}}.
-#' @param dm list of length \code{nStates} containing one vector per state, whose length determines the size \eqn{m_i} of the state's aggregate. Its content depends on \code{type}:
+#' @param dm state dwell-time distributions arranged in a list of length \code{nStates}. Each list element needs to be a vector of length \eqn{m_i}, where \eqn{m_i} is the state aggregate size. Its content depends on \code{type}:
 #' \itemize{
-#'   \item \code{type = "coxian"}: the probabilities of the dwell time falling into the grid intervals \eqn{((k-1)\Delta_i, k\Delta_i]}, \eqn{k = 1, \dots, m_i}, from which the discrete hazards are computed.
-#'   \item \code{type = "bernstein"}: the entry probabilities of the sub-states, obtained from the dwell-time CDF at the Bernstein sampling points.
+#'   \item \code{type = "coxian"}: the probabilities of the dwell time falling into the intervals \eqn{((k-1)\Delta_i, k\Delta_i]}, \eqn{k = 1, \dots, m_i}, with \eqn{\Delta_i = t_{\max,i} / (m_i - 1)}.
+#'   \item \code{type = "bernstein"}: the differences of the dwell-time CDF at the sampling points \eqn{\log(m_i/k) / t_{\max,i}}, \eqn{k = 0, \dots, m_i}.
 #' }
-#' @param tmax vector of length \code{nStates} containing the upper end of the time grid for each state, only needed for \code{type = "coxian"}. Together with the state aggregate sizes, it determines the grid widths \eqn{\Delta_i = t_{\max,i} / m_i}.
-#' @param type character string specifying the construction of the state aggregates, either \code{"coxian"} (default) for the modified Coxian or \code{"bernstein"} for the Bernstein phase-type approximation.
-#' @param kappa scaling parameter for the Bernstein phase-type approximation of length 1 or \code{nStates}, only used for \code{type = "bernstein"}. Defaults to \code{1}, which corresponds to the unscaled Bernstein phase-type distribution.
+#' @param tmax vector of length \code{nStates}. For \code{type = "coxian"}, the start of the exponential tail of each state (required). For \code{type = "bernstein"}, the scaling parameter of each state determining the sampling points; if \code{NULL} (default), all are set to \code{1}. The same values must be used when computing \code{dm}.
+#' @param type character string specifying the construction of the state aggregates, either \code{"coxian"} (default) or \code{"bernstein"}.
+#' @param Fm optional list of length \code{nStates} containing the dwell-time CDF values at the interval starts, only used for \code{type = "coxian"}.
 #' @param sparse logical, indicating whether the output should be a \strong{sparse} matrix. Defaults to \code{TRUE}.
-#' @param eps small value to avoid numerical issues in the construction of the state aggregates. Usually, this should not be changed.
+#' @param eps small value to avoid numerical issues. Usually, this should not be changed.
 #'
-#' @return extended-state-space generator matrix of the approximating CTHMM of dimension \code{c(M, M)}
+#' @return extended-state-space generator matrix of the approximating CTHMM
 #' @export
 #'
 #' @examples
@@ -1487,24 +1489,22 @@ ph_bernstein <- function(dm_i, tmax_i, kappa = 1) {
 #' shape = c(1.5, 2)
 #' scale = c(2, 5)
 #'
-#' # modified Coxian: interval probabilities on an equidistant grid
-#' tmax = c(8, 15)
+#' # modified Coxian: exponential tail starting at the 0.99 quantile
+#' tmax = qweibull(0.99, shape, scale)
 #' dm = lapply(1:2, function(i) {
-#'   grid = seq(0, tmax[i], length.out = sizes[i] + 1)
-#'   diff(pweibull(grid, shape[i], scale[i]))
+#'   t = (0:sizes[i]) * tmax[i] / (sizes[i] - 1)
+#'   diff(pweibull(t, shape[i], scale[i]))
 #' })
 #' Q = generator_cthsmm(omega, dm, tmax = tmax, type = "coxian")
 #'
-#' # Bernstein phase-type: entry probabilities at the Bernstein sampling points
-#' kappa = 1
+#' # Bernstein phase-type: CDF differences at the sampling points (default tmax = 1)
 #' dm = lapply(1:2, function(i) {
-#'   x = log(sizes[i] / (0:sizes[i])) / kappa # first point is Inf in which case we assume its limiting value to be 1.
+#'   x = log(sizes[i] / (0:sizes[i])) # first point is Inf, where the CDF is 1
 #'   -diff(pweibull(x, shape[i], scale[i]))
 #' })
-#' Q = generator_cthsmm(omega, dm, type = "bernstein", kappa = kappa)
-
+#' Q = generator_cthsmm(omega, dm, type = "bernstein")
 generator_cthsmm <- function(omega, dm, tmax = NULL, type = c("coxian", "bernstein"),
-                             kappa = NULL, sparse = TRUE, eps = 1e-10) {
+                             Fm = NULL, sparse = TRUE, eps = 1e-10) {
   "[<-" <- ADoverload("[<-")
   "c" <- ADoverload("c")
   "diag<-" <- ADoverload("diag<-")
@@ -1514,44 +1514,37 @@ generator_cthsmm <- function(omega, dm, tmax = NULL, type = c("coxian", "bernste
   N  = length(Nv)
 
   # construction-specific arguments
+  if (any(Nv < 2)) stop("The aggregate sizes need to be at least 2.")
   if (type == "coxian") {
     if (is.null(tmax) || length(tmax) != N) stop("For type = 'coxian', tmax needs to have length nStates.")
-    if (!is.null(kappa)) warning("kappa is only used for type = 'bernstein' and will be ignored.")
   } else {
-    if (is.null(kappa)) kappa = 1 # Unscaled base BPH
-    if (!(length(kappa) %in% c(1, N))) stop("kappa needs to have length 1 or nStates.")
+    if (is.null(tmax)) tmax = rep(1, N) # unscaled Bernstein phase-type
+    if (length(tmax) != N) stop("For type = 'bernstein', tmax needs to be NULL or have length nStates.")
   }
 
-  # Pre-allocate Generator
-  M  = sum(Nv)
+  # pre-allocate generator
+  M = sum(Nv)
   Q = matrix(0, M, M)
- 
-  
-  if (length(tmax) != N) stop("tmax needs to have length nStates.")
-    if (type == "bernstein" && any(Nv < 2)) {
-      stop("The Bernstein construction needs at least 2 phases per state.")
-    }
-    
   starts = c(0, cumsum(Nv))
-  # Construct phase-type blocks
+
+  # state aggregates
   ph = lapply(1:N, function(i) {
     if (type == "coxian") {
-      ph_coxian(dm[[i]], tmax[i], eps = eps)
+      ph_coxian(dm[[i]], tmax[i], Fm_i = if (is.null(Fm)) NULL else Fm[[i]], eps = eps)
     } else {
-      kappa_i = if (length(kappa) == 1) kappa else kappa[i]
-      ph_bernstein(dm[[i]], kappa_i)
+      ph_bernstein(dm[[i]], tmax[i])
     }
   })
 
   for (i in 1:N) {
     idx_i = (starts[i] + 1):starts[i + 1]
-    Q[idx_i, idx_i] = ph[[i]]$B # fills the diagonals with the ph blocks                  
+    Q[idx_i, idx_i] = ph[[i]]$B # fills the diagonals with the subgenerators         
 
     rows = idx_i[ph[[i]]$exit_rows]
-    b_i  = ph[[i]]$b[ph[[i]]$exit_rows] # exit rate vectors
+    b_i  = ph[[i]]$b[ph[[i]]$exit_rows] # exit rates
 
-    # Fill off-diagonal blocks with C_ij
-    for (j in setdiff(1:N, i)) { 
+    #Fill off-diagonal with transition blocks between aggregates C_ij = omega_ij * b_i alpha_j
+    for (j in setdiff(1:N, i)) {
       cols    = starts[j] + ph[[j]]$entry_cols
       alpha_j = ph[[j]]$alpha[ph[[j]]$entry_cols]
       Q[rows, cols] = omega[i, j] * (matrix(b_i, ncol = 1) %*% matrix(alpha_j, nrow = 1))
